@@ -1,0 +1,1283 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const TW = 20, TH = 20;
+const MAP_W = 60, MAP_H = 56;
+const SKY_H = 4;
+const SURFACE_ROW = SKY_H;
+const VW = 18, VH = 11;
+const RENDER_SCALE = 2;
+const CANVAS_W = VW * TW * RENDER_SCALE;
+const CANVAS_H = VH * TH * RENDER_SCALE;
+
+const T = { SKY: 0, GRASS: 1, DIRT: 2, STONE: 3, DUG: 4, BEDROCK: 5, LIGHT_HOLE: 6 };
+
+const FURNITURE_LIST = [
+  { id: "ladder",    label: "はしご",     color: "#C8A060", sym: "‖",  w: 1 },
+  { id: "lamp",      label: "ランプ",     color: "#FFD060", sym: "♦",  w: 1, light: 3 },
+  { id: "fireplace", label: "暖炉",       color: "#FF6030", sym: "🔥", w: 1, light: 4 },
+  { id: "bookshelf", label: "本棚",       color: "#8B5A2B", sym: "📚", w: 2 },
+  { id: "bed",       label: "ベッド",     color: "#5080D0", sym: "▭",  w: 2 },
+  { id: "workbench", label: "作業台",     color: "#A0825A", sym: "⚒",  w: 2 },
+  { id: "aquarium",  label: "水槽",       color: "#40B0D0", sym: "🐟", w: 2, light: 2 },
+  { id: "plant",     label: "大きな植物", color: "#5DBB5D", sym: "✿",  w: 1 },
+  { id: "chest",     label: "宝箱",       color: "#C8A030", sym: "◈",  w: 1 },
+  { id: "rug",       label: "ペルシャ絨毯", color: "#C03030", sym: "▪", w: 2 },
+  { id: "wallmap",   label: "壁の地図",   color: "#D4B896", sym: "🗺",  w: 1 },
+  { id: "table",     label: "食卓",       color: "#8B6914", sym: "◻",  w: 2 },
+];
+
+// ── Furniture image registry ──
+// Place PNGs in /public/furniture/ and deploy to Vercel
+// 1-tile: 20x20px, 2-tile: 40x20px (transparent background)
+const FURNITURE_IMAGE_DIR = "/furniture/";
+
+// Preload images
+const furnitureImageCache = {};
+function getFurnitureImage(id) {
+  if (furnitureImageCache[id] !== undefined) return furnitureImageCache[id];
+  const img = new Image();
+  img.src = `${FURNITURE_IMAGE_DIR}${id}.png`;
+  img.onerror = () => { furnitureImageCache[id] = null; };
+  img.onload = () => { furnitureImageCache[id] = img; };
+  furnitureImageCache[id] = null; // null until loaded
+  return null;
+}
+const ROOM_STYLES = [
+  {
+    id: "raw",    label: "素掘り",
+    bg: "#111111", floor: null, wall: null, ceil: null,
+  },
+  {
+    id: "wood",   label: "木造",
+    bg: "#1a0f06",
+    floor: { base: "#7B4F1A", stripe: "#6B3F10", h: 5 },
+    wall:  { base: "#5C3410", stripe: "#4C2A08", w: 4 },
+    ceil:  { base: "#4A2A0A", h: 3 },
+    accent: "#C8882A",
+  },
+  {
+    id: "stone",  label: "石造り",
+    bg: "#141414",
+    floor: { base: "#404040", stripe: "#303030", h: 4 },
+    wall:  { base: "#383838", stripe: "#282828", w: 4 },
+    ceil:  { base: "#303030", h: 3 },
+    accent: "#808080",
+  },
+  {
+    id: "clay",   label: "土壁",
+    bg: "#1C1008",
+    floor: { base: "#6B4020", stripe: "#5A3018", h: 4 },
+    wall:  { base: "#5A3820", stripe: "#4A2818", w: 3 },
+    ceil:  { base: "#3A2010", h: 3 },
+    accent: "#C0703A",
+  },
+  {
+    id: "cave",   label: "洞窟",
+    bg: "#0A0A18",
+    floor: { base: "#1A1A40", stripe: "#141430", h: 5 },
+    wall:  { base: "#181830", stripe: "#101028", w: 4 },
+    ceil:  { base: "#141428", h: 3 },
+    accent: "#5050C0",
+  },
+];
+
+// ── Audio engine ──
+function createAudio() {
+  let ctx = null;
+  let droneNode = null, droneGain = null;
+  let windNode = null, windGain = null;
+
+  function getCtx() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return ctx;
+  }
+
+  function playDig(isStoneTile) {
+    const ac = getCtx();
+    const buf = ac.createBuffer(1, ac.sampleRate * 0.12, ac.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      const t = i / ac.sampleRate;
+      const env = Math.exp(-t * (isStoneTile ? 18 : 12));
+      data[i] = (Math.random() * 2 - 1) * env * (isStoneTile ? 0.5 : 0.38);
+    }
+    const src = ac.createBufferSource();
+    const filt = ac.createBiquadFilter();
+    filt.type = "bandpass";
+    filt.frequency.value = isStoneTile ? 180 : 320;
+    filt.Q.value = 1.2;
+    const gain = ac.createGain();
+    gain.gain.value = 0.7;
+    src.buffer = buf;
+    src.connect(filt); filt.connect(gain); gain.connect(ac.destination);
+    src.start();
+  }
+
+  function playStep() {
+    const ac = getCtx();
+    const buf = ac.createBuffer(1, ac.sampleRate * 0.06, ac.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      const env = Math.exp(-i / ac.sampleRate * 30);
+      data[i] = (Math.random() * 2 - 1) * env * 0.18;
+    }
+    const src = ac.createBufferSource();
+    const filt = ac.createBiquadFilter();
+    filt.type = "lowpass"; filt.frequency.value = 600;
+    src.buffer = buf; src.connect(filt); filt.connect(ac.destination);
+    src.start();
+  }
+
+  function playPlace() {
+    const ac = getCtx();
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(520, ac.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(380, ac.currentTime + 0.12);
+    gain.gain.setValueAtTime(0.18, ac.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.18);
+    osc.connect(gain); gain.connect(ac.destination);
+    osc.start(); osc.stop(ac.currentTime + 0.2);
+  }
+
+  function startDrone() {
+    if (droneNode) return;
+    const ac = getCtx();
+    droneNode = ac.createOscillator();
+    droneGain = ac.createGain();
+    const filt = ac.createBiquadFilter();
+    droneNode.type = "sine";
+    droneNode.frequency.value = 55;
+    filt.type = "lowpass"; filt.frequency.value = 180;
+    droneGain.gain.setValueAtTime(0, ac.currentTime);
+    droneGain.gain.linearRampToValueAtTime(0.06, ac.currentTime + 2);
+    droneNode.connect(filt); filt.connect(droneGain); droneGain.connect(ac.destination);
+    droneNode.start();
+  }
+
+  function stopDrone() {
+    if (!droneNode) return;
+    const ac = getCtx();
+    droneGain.gain.linearRampToValueAtTime(0, ac.currentTime + 1.5);
+    droneNode.stop(ac.currentTime + 1.6);
+    droneNode = null; droneGain = null;
+  }
+
+  function startWind() {
+    if (windNode) return;
+    const ac = getCtx();
+    const bufSize = ac.sampleRate * 3;
+    const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+    windNode = ac.createBufferSource();
+    windNode.buffer = buf; windNode.loop = true;
+    const filt = ac.createBiquadFilter();
+    filt.type = "bandpass"; filt.frequency.value = 800; filt.Q.value = 0.4;
+    windGain = ac.createGain();
+    windGain.gain.setValueAtTime(0, ac.currentTime);
+    windGain.gain.linearRampToValueAtTime(0.12, ac.currentTime + 3);
+    windNode.connect(filt); filt.connect(windGain); windGain.connect(ac.destination);
+    windNode.start();
+  }
+
+  function stopWind() {
+    if (!windNode) return;
+    const ac = getCtx();
+    windGain.gain.linearRampToValueAtTime(0, ac.currentTime + 1);
+    windNode.stop(ac.currentTime + 1.1);
+    windNode = null; windGain = null;
+  }
+
+  return { playDig, playStep, playPlace, startDrone, stopDrone, startWind, stopWind };
+}
+
+const audio = createAudio();
+
+function isSolid(map, x, y) {
+  if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H) return true;
+  const t = map[y][x];
+  return t === T.DIRT || t === T.STONE || t === T.GRASS || t === T.BEDROCK;
+}
+
+function generateMap() {
+  const map = [];
+  for (let y = 0; y < MAP_H; y++) {
+    map[y] = [];
+    for (let x = 0; x < MAP_W; x++) {
+      if (y < SKY_H)              map[y][x] = T.SKY;
+      else if (y === SURFACE_ROW) map[y][x] = T.GRASS;
+      else if (y < 24)            map[y][x] = T.DIRT;
+      else if (y >= MAP_H - 2)   map[y][x] = T.BEDROCK;
+      else                        map[y][x] = T.STONE;
+    }
+  }
+  const sx = Math.floor(MAP_W / 2);
+  for (let y = SURFACE_ROW + 1; y <= SURFACE_ROW + 3; y++) map[y][sx] = T.DUG;
+  return map;
+}
+
+function drawDugTile(ctx, px, py, mx, my, map, style) {
+  // Background
+  ctx.fillStyle = style.bg;
+  ctx.fillRect(px, py, TW, TH);
+
+  if (!style.floor && !style.wall && !style.ceil) return; // raw style
+
+  const above = isSolid(map, mx, my - 1);
+  const below = isSolid(map, mx, my + 1);
+  const left  = isSolid(map, mx - 1, my);
+  const right  = isSolid(map, mx + 1, my);
+
+  // Ceiling strip
+  if (above && style.ceil) {
+    ctx.fillStyle = style.ceil.base;
+    ctx.fillRect(px, py, TW, style.ceil.h);
+    // drip
+    if ((mx * 3 + my * 7) % 9 === 0) {
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.fillRect(px + 8, py + style.ceil.h, 2, 3);
+    }
+  }
+
+  // Floor strip
+  if (below && style.floor) {
+    const fy = py + TH - style.floor.h;
+    ctx.fillStyle = style.floor.base;
+    ctx.fillRect(px, fy, TW, style.floor.h);
+    // planks / stripes
+    if ((mx) % 3 === 0) {
+      ctx.fillStyle = style.floor.stripe;
+      ctx.fillRect(px, fy, 1, style.floor.h);
+    }
+    if ((mx + 1) % 3 === 0) {
+      ctx.fillStyle = style.floor.stripe;
+      ctx.fillRect(px + TW - 1, fy, 1, style.floor.h);
+    }
+  }
+
+  // Left wall strip
+  if (left && style.wall) {
+    ctx.fillStyle = style.wall.base;
+    ctx.fillRect(px, py, style.wall.w, TH);
+    // brick line
+    if (my % 2 === 0) {
+      ctx.fillStyle = style.wall.stripe;
+      ctx.fillRect(px, py + TH / 2, style.wall.w, 1);
+    }
+  }
+
+  // Right wall strip
+  if (right && style.wall) {
+    ctx.fillStyle = style.wall.base;
+    ctx.fillRect(px + TW - style.wall.w, py, style.wall.w, TH);
+    if (my % 2 === 1) {
+      ctx.fillStyle = style.wall.stripe;
+      ctx.fillRect(px + TW - style.wall.w, py + TH / 2, style.wall.w, 1);
+    }
+  }
+
+  // Corner accents
+  if (style.accent) {
+    if (above && left)  { ctx.fillStyle = style.accent; ctx.fillRect(px, py, 2, 2); }
+    if (above && right) { ctx.fillStyle = style.accent; ctx.fillRect(px + TW - 2, py, 2, 2); }
+    if (below && left)  { ctx.fillStyle = style.accent; ctx.fillRect(px, py + TH - 2, 2, 2); }
+    if (below && right) { ctx.fillStyle = style.accent; ctx.fillRect(px + TW - 2, py + TH - 2, 2, 2); }
+  }
+}
+
+// Gravity helpers
+function isPassable(map, x, y) {
+  if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H) return false;
+  const t = map[y][x];
+  return t === T.DUG || t === T.SKY || t === T.GRASS || t === T.LIGHT_HOLE;
+}
+function hasLadder(furniture, x, y) {
+  return furniture[`${x},${y}`] === "ladder";
+}
+function isGrounded(map, furniture, px, py) {
+  if (map[py][px] === T.GRASS) return true;
+  const below = py + 1;
+  if (below >= MAP_H) return true;
+  if (!isPassable(map, px, below)) return true;
+  if (hasLadder(furniture, px, py)) return true;
+  if (hasLadder(furniture, px, below)) return true;
+  return false;
+}
+
+const tileColor = t => ({
+  [T.SKY]: "#8ECDE8", [T.GRASS]: "#6AAF3D",
+  [T.DIRT]: "#5C3D24", [T.STONE]: "#464646",
+  [T.BEDROCK]: "#0A0A0A", [T.LIGHT_HOLE]: "#FFFDE0",
+}[t] ?? "#222");
+
+// ── Pixel art drawers ──
+
+function drawDirt(ctx, px, py, mx, my) {
+  ctx.fillStyle = "#5C3D24"; ctx.fillRect(px, py, TW, TH);
+  const v = (mx * 13 + my * 7) % 4;
+  if (v === 0) { ctx.fillStyle = "#4E3020"; ctx.fillRect(px+3, py+3, 7, 5); }
+  if (v === 1) { ctx.fillStyle = "#6A4530"; ctx.fillRect(px+10, py+10, 6, 4); }
+  if ((mx * 5 + my * 11) % 7 === 0) { ctx.fillStyle = "#3A2010"; ctx.fillRect(px+12, py+5, 3, 3); }
+  if ((mx * 3 + my * 9)  % 9 === 0) { ctx.fillStyle = "#7A5030"; ctx.fillRect(px+5,  py+13, 2, 2); }
+  ctx.fillStyle = "rgba(0,0,0,0.2)"; ctx.fillRect(px, py, TW, 2);
+  ctx.fillStyle = "rgba(0,0,0,0.1)"; ctx.fillRect(px+TW-2, py, 2, TH);
+}
+
+function drawStone(ctx, px, py, mx, my) {
+  const base = (mx * 7 + my * 3) % 3 === 0 ? "#3E3E3E" : "#484848";
+  ctx.fillStyle = base; ctx.fillRect(px, py, TW, TH);
+  if ((mx + my * 2) % 5 === 0) {
+    ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px+4, py+2); ctx.lineTo(px+8, py+9); ctx.lineTo(px+6, py+16); ctx.stroke();
+  }
+  if ((mx * 2 + my) % 7 === 0) {
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px+14, py+4); ctx.lineTo(px+16, py+11); ctx.stroke();
+  }
+  if ((mx * 11 + my * 5) % 8 === 0) { ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fillRect(px+2, py+2, 4, 2); }
+  ctx.fillStyle = "rgba(0,0,0,0.2)"; ctx.fillRect(px, py+TH-3, TW, 3);
+  ctx.fillStyle = "rgba(255,255,255,0.04)"; ctx.fillRect(px, py, TW, 2);
+}
+
+function drawFurniture(ctx, px, py, id) {
+  if (id.startsWith("_")) return; // right half marker, drawn by left
+  const def = FURNITURE_LIST.find(f => f.id === id);
+  const wide = def && def.w === 2;
+  const W = wide ? TW * 2 : TW;
+
+  // Try image first
+  const img = getFurnitureImage(id);
+  if (img && img.complete && img.naturalWidth > 0) {
+    ctx.drawImage(img, px, py, W, TH);
+    return;
+  }
+
+  ctx.save(); ctx.translate(px, py);
+  switch(id) {
+    case "ladder": {
+      ctx.fillStyle = "#9B6F2A"; ctx.fillRect(3,0,2,TH); ctx.fillRect(15,0,2,TH);
+      ctx.fillStyle = "#C8A050";
+      ctx.fillRect(3,2,14,2); ctx.fillRect(3,7,14,2);
+      ctx.fillRect(3,12,14,2); ctx.fillRect(3,17,14,2);
+      ctx.fillStyle = "rgba(0,0,0,0.2)";
+      ctx.fillRect(3,3,14,1); ctx.fillRect(3,8,14,1);
+      ctx.fillRect(3,13,14,1); ctx.fillRect(3,18,14,1);
+      break;
+    }
+    case "lamp": {
+      // Stand
+      ctx.fillStyle = "#6B4F10"; ctx.fillRect(9,10,2,9);
+      ctx.fillStyle = "#5A3E0A"; ctx.fillRect(6,18,8,2);
+      // Shade
+      ctx.fillStyle = "#C89030"; ctx.fillRect(4,4,12,2);
+      ctx.fillStyle = "#E8A840"; ctx.fillRect(3,6,14,4);
+      ctx.fillStyle = "#D09030"; ctx.fillRect(4,10,12,1);
+      // Glow bulb
+      ctx.fillStyle = "#FFFFA0"; ctx.fillRect(8,6,4,3);
+      ctx.fillStyle = "#FFF8D0"; ctx.fillRect(9,7,2,1);
+      // Light halo
+      ctx.fillStyle = "rgba(255,220,100,0.08)";
+      ctx.beginPath(); ctx.arc(10, 8, 24, 0, Math.PI*2); ctx.fill();
+      break;
+    }
+    case "fireplace": {
+      const t = Date.now();
+      // Stone frame
+      ctx.fillStyle = "#4A4040"; ctx.fillRect(1,4,18,16);
+      ctx.fillStyle = "#3A3030"; ctx.fillRect(3,6,14,12);
+      ctx.fillStyle = "#555"; ctx.fillRect(1,4,18,2);
+      ctx.fillStyle = "#5A5050"; ctx.fillRect(0,3,20,2);
+      // Fire
+      const flicker = Math.sin(t/100)*2;
+      ctx.fillStyle = "#FF4010"; ctx.fillRect(5,11+flicker,10,5-flicker);
+      ctx.fillStyle = "#FF8020"; ctx.fillRect(6,9+flicker,8,4);
+      ctx.fillStyle = "#FFD040"; ctx.fillRect(8,8+flicker,4,3);
+      ctx.fillStyle = "#FFF080"; ctx.fillRect(9,9+flicker,2,2);
+      // Embers
+      ctx.fillStyle = "#FF3000"; ctx.fillRect(5+((t/200)%3|0),16,2,1);
+      ctx.fillStyle = "#FF6020"; ctx.fillRect(12+((t/300)%2|0),15,1,2);
+      // Logs
+      ctx.fillStyle = "#4A2810"; ctx.fillRect(4,16,12,2);
+      ctx.fillStyle = "#3A1808"; ctx.fillRect(5,15,4,2);
+      ctx.fillStyle = "#3A1808"; ctx.fillRect(11,15,4,2);
+      // Warm glow halo
+      const glow = 0.06 + Math.sin(t/400)*0.02;
+      ctx.fillStyle = `rgba(255,120,30,${glow})`;
+      ctx.beginPath(); ctx.arc(10, 12, 30, 0, Math.PI*2); ctx.fill();
+      break;
+    }
+    case "bookshelf": {
+      // Frame
+      ctx.fillStyle = "#5A3010"; ctx.fillRect(0,2,W,17);
+      ctx.fillStyle = "#7B4F1A"; ctx.fillRect(1,3,W-2,15);
+      // Shelves
+      ctx.fillStyle = "#9B6F2A";
+      ctx.fillRect(0,2,W,2); ctx.fillRect(0,8,W,2); ctx.fillRect(0,14,W,2); ctx.fillRect(0,18,W,2);
+      // Books - top shelf (varied colors and heights)
+      const books1 = ["#C03030","#3050A0","#208040","#A06020","#6030A0","#C08020","#2080A0","#A02060"];
+      for (let i=0;i<8;i++) { ctx.fillStyle = books1[i]; ctx.fillRect(2+i*4.5,4,3, i%2?4:3); }
+      // Books - middle shelf
+      const books2 = ["#D0A030","#305080","#80A030","#A03040","#2060A0","#C06030","#40A060","#8040A0"];
+      for (let i=0;i<8;i++) { ctx.fillStyle = books2[i]; ctx.fillRect(1+i*4.8,10,4, i%3?3:4); }
+      // Books - bottom shelf
+      const books3 = ["#5050B0","#B05020","#20A050","#A0A030","#7030B0","#30A0A0","#B03060","#508030"];
+      for (let i=0;i<8;i++) { ctx.fillStyle = books3[i]; ctx.fillRect(2+i*4.6,15,3, i%2?3:2); }
+      // Spine details
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      ctx.fillRect(4,5,1,2); ctx.fillRect(14,11,1,2); ctx.fillRect(24,15,1,2);
+      break;
+    }
+    case "bed": {
+      // Frame
+      ctx.fillStyle = "#5A3010"; ctx.fillRect(0,8,W,11);
+      ctx.fillStyle = "#7B4F1A"; ctx.fillRect(1,9,W-2,9);
+      // Headboard
+      ctx.fillStyle = "#6B3A10"; ctx.fillRect(0,4,6,15);
+      ctx.fillStyle = "#8B5A20"; ctx.fillRect(1,5,4,13);
+      // Footboard
+      ctx.fillStyle = "#6B3A10"; ctx.fillRect(W-4,8,4,11);
+      ctx.fillStyle = "#8B5A20"; ctx.fillRect(W-3,9,2,9);
+      // Mattress
+      ctx.fillStyle = "#E8E0D8"; ctx.fillRect(6,9,W-10,8);
+      // Pillow
+      ctx.fillStyle = "#F0EDE8"; ctx.fillRect(7,10,8,5);
+      ctx.fillStyle = "#FFF8F0"; ctx.fillRect(8,11,6,3);
+      // Blanket
+      ctx.fillStyle = "#4070B8"; ctx.fillRect(16,10,W-20,7);
+      ctx.fillStyle = "#3060A0"; ctx.fillRect(16,15,W-20,2);
+      // Blanket fold
+      ctx.fillStyle = "#5080C8"; ctx.fillRect(16,10,W-20,2);
+      // Legs
+      ctx.fillStyle = "#4A2008"; ctx.fillRect(1,18,3,2); ctx.fillRect(W-4,18,3,2);
+      break;
+    }
+    case "workbench": {
+      // Table surface
+      ctx.fillStyle = "#8B6830"; ctx.fillRect(0,7,W,4);
+      ctx.fillStyle = "#A08040"; ctx.fillRect(0,7,W,1);
+      ctx.fillStyle = "#7A5820"; ctx.fillRect(0,10,W,1);
+      // Legs
+      ctx.fillStyle = "#6B4820"; ctx.fillRect(2,11,3,8); ctx.fillRect(W-5,11,3,8);
+      ctx.fillStyle = "#5A3810"; ctx.fillRect(2,18,3,2); ctx.fillRect(W-5,18,3,2);
+      // Cross beam
+      ctx.fillStyle = "#7A5820"; ctx.fillRect(5,14,W-10,2);
+      // Tools on bench
+      ctx.fillStyle = "#808890"; ctx.fillRect(4,4,2,4); // hammer handle
+      ctx.fillStyle = "#A0A8B0"; ctx.fillRect(3,3,4,2); // hammer head
+      ctx.fillStyle = "#909090"; ctx.fillRect(12,5,1,3); // screwdriver
+      ctx.fillStyle = "#C0C0C0"; ctx.fillRect(11,3,3,2);
+      // Vise
+      ctx.fillStyle = "#606870"; ctx.fillRect(W-10,4,6,4);
+      ctx.fillStyle = "#808890"; ctx.fillRect(W-9,5,4,2);
+      // Scattered nails
+      ctx.fillStyle = "#B0B0B0"; ctx.fillRect(20,6,1,2); ctx.fillRect(23,5,1,2);
+      // Wood shavings
+      ctx.fillStyle = "#C8A860"; ctx.fillRect(16,6,3,1); ctx.fillRect(8,6,2,1);
+      break;
+    }
+    case "aquarium": {
+      const t = Date.now();
+      // Glass frame
+      ctx.fillStyle = "#607080"; ctx.fillRect(0,3,W,16);
+      // Water
+      ctx.fillStyle = "#1A4060"; ctx.fillRect(2,5,W-4,12);
+      ctx.fillStyle = "#1A5070"; ctx.fillRect(2,5,W-4,4);
+      // Gravel
+      ctx.fillStyle = "#6A5A40"; ctx.fillRect(2,15,W-4,2);
+      ctx.fillStyle = "#7A6A50"; ctx.fillRect(4,15,3,1); ctx.fillRect(12,15,4,1); ctx.fillRect(24,15,3,1);
+      // Plants
+      ctx.fillStyle = "#206040"; ctx.fillRect(5,10,2,5); ctx.fillRect(6,8,2,7);
+      ctx.fillStyle = "#30A060"; ctx.fillRect(4,8,3,3);
+      ctx.fillStyle = "#206040"; ctx.fillRect(28,9,2,6); ctx.fillRect(30,11,2,4);
+      ctx.fillStyle = "#30A060"; ctx.fillRect(27,8,4,3);
+      // Fish 1
+      const f1x = 10 + Math.sin(t/800)*6;
+      ctx.fillStyle = "#FF6030"; ctx.fillRect(f1x,8,5,3);
+      ctx.fillStyle = "#FF8050"; ctx.fillRect(f1x+1,9,3,1);
+      ctx.fillStyle = "#FF4020"; ctx.fillRect(f1x-1,9,2,1); // tail
+      ctx.fillStyle = "#000"; ctx.fillRect(f1x+4,8,1,1); // eye
+      // Fish 2
+      const f2x = 22 + Math.cos(t/1000)*5;
+      ctx.fillStyle = "#3090E0"; ctx.fillRect(f2x,11,4,2);
+      ctx.fillStyle = "#50B0FF"; ctx.fillRect(f2x+1,11,2,1);
+      ctx.fillStyle = "#2070C0"; ctx.fillRect(f2x-1,12,2,1);
+      ctx.fillStyle = "#000"; ctx.fillRect(f2x+3,11,1,1);
+      // Bubbles
+      ctx.fillStyle = "rgba(150,220,255,0.5)";
+      const by = 7 + ((t/400)%5);
+      ctx.fillRect(18, by, 2, 2);
+      ctx.fillRect(20, by-2, 1, 1);
+      // Light on stand
+      ctx.fillStyle = "#90E0FF"; ctx.fillRect(4,4,W-8,1);
+      // Stand
+      ctx.fillStyle = "#505860"; ctx.fillRect(2,17,3,3); ctx.fillRect(W-5,17,3,3);
+      // Glass reflection
+      ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(3,5,2,10);
+      break;
+    }
+    case "plant": {
+      // Big pot
+      ctx.fillStyle = "#B06030"; ctx.fillRect(4,14,12,5);
+      ctx.fillStyle = "#C87040"; ctx.fillRect(3,13,14,2);
+      ctx.fillStyle = "#905020"; ctx.fillRect(5,18,10,2);
+      // Soil
+      ctx.fillStyle = "#3A2010"; ctx.fillRect(5,13,10,2);
+      // Thick trunk
+      ctx.fillStyle = "#2A7A2A"; ctx.fillRect(8,6,4,8);
+      ctx.fillStyle = "#1A6A1A"; ctx.fillRect(9,4,2,3);
+      // Lush leaves
+      ctx.fillStyle = "#3DBB3D"; ctx.fillRect(3,2,6,5); ctx.fillRect(11,1,6,5);
+      ctx.fillStyle = "#50C050"; ctx.fillRect(5,0,5,4); ctx.fillRect(10,0,5,3);
+      ctx.fillStyle = "#60D060"; ctx.fillRect(7,-1,6,3);
+      ctx.fillStyle = "#2AA02A"; ctx.fillRect(1,4,5,4); ctx.fillRect(14,3,5,4);
+      ctx.fillStyle = "#40B840"; ctx.fillRect(3,6,4,3); ctx.fillRect(13,5,4,3);
+      // Leaf shine
+      ctx.fillStyle = "rgba(255,255,255,0.12)"; ctx.fillRect(8,1,3,2);
+      break;
+    }
+    case "chest": {
+      // Body
+      ctx.fillStyle = "#7A4A08"; ctx.fillRect(2,10,16,8);
+      ctx.fillStyle = "#9B6818"; ctx.fillRect(2,6,16,5);
+      // Metal bands
+      ctx.fillStyle = "#C8A030"; ctx.fillRect(2,6,16,1); ctx.fillRect(2,10,16,1);
+      ctx.fillStyle = "#B09020"; ctx.fillRect(2,8,2,9); ctx.fillRect(16,8,2,9);
+      // Lock
+      ctx.fillStyle = "#FFD060"; ctx.fillRect(8,8,4,4);
+      ctx.fillStyle = "#C89030"; ctx.fillRect(9,10,2,1);
+      // Keyhole
+      ctx.fillStyle = "#3A1A00"; ctx.fillRect(9,9,2,1);
+      // Lid curve
+      ctx.fillStyle = "#A07818"; ctx.fillRect(3,6,14,1);
+      ctx.fillStyle = "#B08820"; ctx.fillRect(4,5,12,1);
+      // Bottom shadow
+      ctx.fillStyle = "#5A3008"; ctx.fillRect(2,17,16,1);
+      // Gem decoration
+      ctx.fillStyle = "#E03030"; ctx.fillRect(5,7,2,2);
+      ctx.fillStyle = "#30A0E0"; ctx.fillRect(13,7,2,2);
+      break;
+    }
+    case "rug": {
+      // Base
+      ctx.fillStyle = "#8B1515"; ctx.fillRect(0,13,W,6);
+      // Border
+      ctx.fillStyle = "#C83030"; ctx.fillRect(0,13,W,1); ctx.fillRect(0,18,W,1);
+      ctx.fillStyle = "#C83030"; ctx.fillRect(0,13,1,6); ctx.fillRect(W-1,13,1,6);
+      // Inner border
+      ctx.fillStyle = "#D4A030"; ctx.fillRect(2,14,W-4,1); ctx.fillRect(2,17,W-4,1);
+      ctx.fillStyle = "#D4A030"; ctx.fillRect(2,14,1,4); ctx.fillRect(W-3,14,1,4);
+      // Center medallion
+      ctx.fillStyle = "#D4A030"; ctx.fillRect(W/2-4,15,8,2);
+      ctx.fillStyle = "#E8C050"; ctx.fillRect(W/2-2,15,4,2);
+      // Corner motifs
+      ctx.fillStyle = "#D08030"; ctx.fillRect(4,15,2,2); ctx.fillRect(W-6,15,2,2);
+      // Pattern
+      ctx.fillStyle = "#A02020";
+      for (let i=8;i<W-8;i+=5) { ctx.fillRect(i,15,2,1); }
+      // Fringe
+      ctx.fillStyle = "#D4A030";
+      for (let i=1;i<W-1;i+=2) { ctx.fillRect(i,19,1,1); }
+      break;
+    }
+    case "wallmap": {
+      // Paper
+      ctx.fillStyle = "#D4C8A0"; ctx.fillRect(2,3,16,14);
+      ctx.fillStyle = "#C8BC90"; ctx.fillRect(2,3,16,1);
+      // Curled edges
+      ctx.fillStyle = "#BEB080"; ctx.fillRect(2,3,1,14); ctx.fillRect(17,3,1,14);
+      // Map content - land
+      ctx.fillStyle = "#7AAA50"; ctx.fillRect(5,6,4,4);
+      ctx.fillStyle = "#6A9A40"; ctx.fillRect(10,8,5,3);
+      ctx.fillStyle = "#7AAA50"; ctx.fillRect(7,11,3,3);
+      // Water
+      ctx.fillStyle = "#5090C0"; ctx.fillRect(8,6,3,2);
+      ctx.fillStyle = "#5090C0"; ctx.fillRect(14,10,3,4);
+      // X marks the spot
+      ctx.fillStyle = "#E03030"; ctx.fillRect(12,7,2,2);
+      // Pins
+      ctx.fillStyle = "#E03030"; ctx.fillRect(3,3,2,2);
+      ctx.fillStyle = "#3060C0"; ctx.fillRect(15,3,2,2);
+      // Compass rose
+      ctx.fillStyle = "#806040"; ctx.fillRect(4,13,3,3);
+      ctx.fillStyle = "#A08060"; ctx.fillRect(5,14,1,1);
+      break;
+    }
+    case "table": {
+      // Table top
+      ctx.fillStyle = "#9B6F2A"; ctx.fillRect(0,7,W,4);
+      ctx.fillStyle = "#B08030"; ctx.fillRect(0,7,W,1);
+      ctx.fillStyle = "#8A5F1A"; ctx.fillRect(0,10,W,1);
+      // Wood grain
+      ctx.fillStyle = "rgba(0,0,0,0.06)";
+      ctx.fillRect(5,8,1,2); ctx.fillRect(15,8,1,2); ctx.fillRect(25,8,1,2); ctx.fillRect(35,8,1,2);
+      // Legs
+      ctx.fillStyle = "#7A4F1A"; ctx.fillRect(2,11,3,8); ctx.fillRect(W-5,11,3,8);
+      ctx.fillStyle = "#6A3F0A"; ctx.fillRect(2,18,3,2); ctx.fillRect(W-5,18,3,2);
+      // Cross beam
+      ctx.fillStyle = "#7A4F1A"; ctx.fillRect(5,14,W-10,2);
+      // Food on table
+      // Plate
+      ctx.fillStyle = "#E0D8D0"; ctx.fillRect(8,4,7,4);
+      ctx.fillStyle = "#F0E8E0"; ctx.fillRect(9,5,5,2);
+      // Bread
+      ctx.fillStyle = "#C89040"; ctx.fillRect(10,4,3,2);
+      ctx.fillStyle = "#E0A850"; ctx.fillRect(10,4,3,1);
+      // Cup
+      ctx.fillStyle = "#D0C0A0"; ctx.fillRect(22,4,4,4);
+      ctx.fillStyle = "#8B4020"; ctx.fillRect(23,5,2,2); // coffee
+      ctx.fillStyle = "#D0C0A0"; ctx.fillRect(26,5,1,2); // handle
+      // Candle
+      ctx.fillStyle = "#E8E0D0"; ctx.fillRect(W/2-1,3,2,4);
+      ctx.fillStyle = "#FFD040"; ctx.fillRect(W/2-1,2,2,2);
+      ctx.fillStyle = "#FF8020"; ctx.fillRect(W/2,1,1,2);
+      break;
+    }
+  }
+  ctx.restore();
+}
+
+// Lighting: collect light sources and compute glow
+function getLightSources(furniture) {
+  const sources = [];
+  for (const [key, id] of Object.entries(furniture)) {
+    if (id.startsWith("_")) continue;
+    const def = FURNITURE_LIST.find(f => f.id === id);
+    if (def && def.light) {
+      const [x, y] = key.split(",").map(Number);
+      sources.push({ x, y, r: def.light, id });
+    }
+  }
+  return sources;
+}
+
+function getLightAt(sources, mx, my) {
+  let total = 0;
+  for (const s of sources) {
+    const dx = mx - s.x, dy = my - s.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist < s.r + 0.5) {
+      const intensity = 1 - dist / (s.r + 0.5);
+      total += intensity * (s.id === "fireplace" ? 0.25 : s.id === "aquarium" ? 0.12 : 0.18);
+    }
+  }
+  return Math.min(total, 0.35);
+}
+
+function drawPlayer(ctx, px, py) {
+  ctx.save(); ctx.translate(px, py);
+  // Shadow
+  ctx.fillStyle = "rgba(0,0,0,0.3)"; ctx.fillRect(4,18,12,2);
+  // Boots
+  ctx.fillStyle = "#3A2810"; ctx.fillRect(5,18,4,2); ctx.fillRect(11,18,4,2);
+  // Legs
+  ctx.fillStyle = "#5A4080"; ctx.fillRect(6,13,3,6); ctx.fillRect(11,13,3,6);
+  ctx.fillStyle = "#403060"; ctx.fillRect(6,17,3,1); ctx.fillRect(11,17,3,1);
+  // Body
+  ctx.fillStyle = "#C04040"; ctx.fillRect(5,7,10,7);
+  ctx.fillStyle = "#E05050"; ctx.fillRect(5,7,10,2);
+  ctx.fillStyle = "#A03030"; ctx.fillRect(5,12,10,2);
+  // Belt
+  ctx.fillStyle = "#5A3010"; ctx.fillRect(5,13,10,1);
+  ctx.fillStyle = "#C8A030"; ctx.fillRect(9,13,2,1);
+  // Arms
+  ctx.fillStyle = "#C04040"; ctx.fillRect(2,8,3,5); ctx.fillRect(15,8,3,5);
+  ctx.fillStyle = "#FFDAB9"; ctx.fillRect(2,12,3,2); ctx.fillRect(15,12,3,2);
+  // Neck
+  ctx.fillStyle = "#FFDAB9"; ctx.fillRect(8,5,4,3);
+  // Head
+  ctx.fillStyle = "#FFDAB9"; ctx.fillRect(5,1,10,7);
+  ctx.fillStyle = "#FFE8CC"; ctx.fillRect(5,1,10,2);
+  // Hair
+  ctx.fillStyle = "#3A2010"; ctx.fillRect(5,1,10,2);
+  ctx.fillStyle = "#3A2010"; ctx.fillRect(5,2,2,2); ctx.fillRect(13,2,2,2);
+  // Eyes
+  ctx.fillStyle = "#202020"; ctx.fillRect(7,4,2,2); ctx.fillRect(11,4,2,2);
+  ctx.fillStyle = "#FFFFFF"; ctx.fillRect(8,4,1,1); ctx.fillRect(12,4,1,1);
+  // Mouth
+  ctx.fillStyle = "#C08070"; ctx.fillRect(8,7,4,1);
+  ctx.restore();
+}
+
+export default function Game() {
+  const canvasRef  = useRef(null);
+  const [scale, setScale] = useState(1);
+
+  const gs = useRef({
+    map: generateMap(), furniture: {},
+    player: { x: Math.floor(MAP_W / 2), y: SURFACE_ROW },
+    phase: "playing", furniIdx: 0, roomStyleIdx: 0,
+    surfaceTimer: 0, windParticles: [],
+    lightRays: [], flipTimer: 0, lightHoleX: 0, lightHoleY: 0,
+  });
+  const keys     = useRef({});
+  const keyLatch = useRef({});
+  const raf      = useRef(null);
+  const [ui, setUi] = useState({ phase: "playing", furniIdx: 0, furniCount: 0, roomStyleIdx: 0 });
+
+  useEffect(() => {
+    const upd = () => setScale(Math.min(1, (window.innerWidth - 16) / CANVAS_W));
+    upd();
+    window.addEventListener("resize", upd);
+    return () => window.removeEventListener("resize", upd);
+  }, []);
+
+  const getCamera = (px, py) => ({
+    cx: Math.max(0, Math.min(MAP_W - VW, px - Math.floor(VW / 2))),
+    cy: Math.max(0, Math.min(MAP_H - VH, py - Math.floor(VH / 2))),
+  });
+
+  const render = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const { map, player, furniture, phase, surfaceTimer, windParticles, roomStyleIdx } = gs.current;
+    const { cx, cy } = getCamera(player.x, player.y);
+    const style = ROOM_STYLES[roomStyleIdx];
+
+    ctx.save();
+    ctx.scale(RENDER_SCALE, RENDER_SCALE);
+
+    // Compute light sources for this frame
+    const lightSources = getLightSources(furniture);
+
+    for (let ty = 0; ty < VH; ty++) {
+      for (let tx = 0; tx < VW; tx++) {
+        const mx = cx + tx, my = cy + ty;
+        const px = tx * TW, py = ty * TH;
+
+        if (mx < 0 || mx >= MAP_W || my < 0 || my >= MAP_H) {
+          ctx.fillStyle = "#111"; ctx.fillRect(px, py, TW, TH); continue;
+        }
+
+        const tile = map[my][mx];
+
+        if (tile === T.DUG) {
+          drawDugTile(ctx, px, py, mx, my, map, style);
+        } else if (tile === T.DIRT) {
+          drawDirt(ctx, px, py, mx, my);
+        } else if (tile === T.STONE) {
+          drawStone(ctx, px, py, mx, my);
+        } else if (tile === T.BEDROCK) {
+          // Dark, dense rock with crystalline hints
+          ctx.fillStyle = "#1A1A1A"; ctx.fillRect(px, py, TW, TH);
+          if ((mx * 7 + my * 3) % 5 === 0) { ctx.fillStyle = "#222"; ctx.fillRect(px+3, py+2, 6, 4); }
+          if ((mx * 11 + my) % 7 === 0) { ctx.fillStyle = "rgba(255,255,255,0.04)"; ctx.fillRect(px+8, py+10, 3, 2); }
+          ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.fillRect(px, py, TW, 2);
+          // Hint: glow from below at the very bottom row
+          if (my === MAP_H - 1 && Object.values(furniture).filter(v => !v.startsWith("_")).length >= 3) {
+            ctx.fillStyle = `rgba(255,240,180,${0.04 + Math.sin(Date.now()/800 + mx) * 0.02})`;
+            ctx.fillRect(px, py + TH - 4, TW, 4);
+          }
+        } else if (tile === T.LIGHT_HOLE) {
+          // Bright hole with light pouring through
+          const pulse = 0.7 + Math.sin(Date.now() / 500) * 0.15;
+          ctx.fillStyle = `rgba(255,250,220,${pulse})`; ctx.fillRect(px, py, TW, TH);
+          ctx.fillStyle = `rgba(255,255,255,${pulse * 0.5})`; ctx.fillRect(px+4, py+4, TW-8, TH-8);
+          // Light rays upward
+          ctx.save();
+          ctx.globalAlpha = 0.15 + Math.sin(Date.now()/700) * 0.05;
+          ctx.fillStyle = "#FFFDE0";
+          for (let r = -3; r <= 3; r++) {
+            const rx = px + TW/2 + r * 8;
+            ctx.beginPath();
+            ctx.moveTo(rx - 2, py); ctx.lineTo(rx + 2, py);
+            ctx.lineTo(rx + r * 4 + 4, py - 60);
+            ctx.lineTo(rx + r * 4 - 4, py - 60);
+            ctx.fill();
+          }
+          ctx.restore();
+        } else {
+          ctx.fillStyle = tileColor(tile);
+          ctx.fillRect(px, py, TW, TH);
+          if (tile === T.SKY && (mx + my * 3) % 11 === 0) {
+            ctx.fillStyle = "rgba(255,255,255,0.18)"; ctx.fillRect(px+2, py+6, 14, 6);
+          }
+          if (tile === T.GRASS) {
+            ctx.fillStyle = "#7DC24A";
+            for (let i = 2; i < TW; i += 5) ctx.fillRect(px+i, py, 2, 3);
+          }
+        }
+
+        // Furniture
+        const key = `${mx},${my}`;
+        if (furniture[key]) drawFurniture(ctx, px, py, furniture[key]);
+
+        // Lighting overlay - warm glow from light sources
+        if (tile === T.DUG) {
+          const glow = getLightAt(lightSources, mx, my);
+          if (glow > 0.005) {
+            // Check if near fireplace for warm vs cool tint
+            let warmest = false;
+            for (const s of lightSources) {
+              const d = Math.sqrt((mx-s.x)**2 + (my-s.y)**2);
+              if (d < s.r + 0.5) {
+                if (s.id === "fireplace") warmest = true;
+                if (s.id === "aquarium" && !warmest) warmest = false;
+              }
+            }
+            const hasAquarium = lightSources.some(s => s.id === "aquarium" && Math.sqrt((mx-s.x)**2+(my-s.y)**2) < s.r+0.5);
+            if (hasAquarium && !warmest) {
+              ctx.fillStyle = `rgba(100,200,255,${glow * 0.6})`;
+            } else {
+              ctx.fillStyle = `rgba(255,200,100,${glow})`;
+            }
+            ctx.fillRect(px, py, TW, TH);
+          }
+        }
+
+        // Player position highlight
+        if (mx === player.x && my === player.y && tile === T.DUG) {
+          ctx.strokeStyle = "rgba(255,255,255,0.2)"; ctx.lineWidth = 1;
+          ctx.strokeRect(px+1, py+1, TW-2, TH-2);
+        }
+      }
+    }
+
+    // Player
+    const ppx = (player.x - cx) * TW, ppy = (player.y - cy) * TH;
+    drawPlayer(ctx, ppx, ppy);
+
+    // Restore from tile-scale to canvas-pixel scale for overlays
+    ctx.restore();
+
+    // Light peek overlay - light rays from below
+    if (phase === "light_peek") {
+      const progress = Math.min(1, surfaceTimer / 3000);
+      // Growing glow from the hole
+      ctx.fillStyle = `rgba(255,250,200,${progress * 0.4})`;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      // Draw light rays
+      if (gs.current.lightRays) {
+        for (const ray of gs.current.lightRays) {
+          ctx.save();
+          ctx.globalAlpha = ray.alpha * progress;
+          ctx.strokeStyle = "#FFFDE0"; ctx.lineWidth = ray.width;
+          ctx.shadowColor = "#FFFDE0"; ctx.shadowBlur = 10;
+          ctx.beginPath();
+          ctx.moveTo(ray.x, ray.y);
+          ctx.lineTo(ray.x + Math.cos(ray.angle) * ray.len * progress,
+                     ray.y + Math.sin(ray.angle) * ray.len * progress);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+      // Text: のぞきこむ
+      if (surfaceTimer > 1500) {
+        const a = Math.min(1, (surfaceTimer - 1500) / 800);
+        ctx.font = "24px 'Hiragino Mincho ProN','Yu Mincho',serif";
+        ctx.textAlign = "center"; ctx.fillStyle = `rgba(80,60,20,${a})`;
+        ctx.fillText("ひかりが、見える。", CANVAS_W / 2, CANVAS_H / 2);
+      }
+    }
+
+    // Flipping phase - handled by CSS transform on wrapper, just dim here
+    if (phase === "flipping") {
+      const progress = Math.min(1, (gs.current.flipTimer || 0) / 2500);
+      ctx.fillStyle = `rgba(255,255,240,${progress})`;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      if (progress > 0.3) {
+        const a = Math.min(1, (progress - 0.3) / 0.4);
+        ctx.font = "24px 'Hiragino Mincho ProN','Yu Mincho',serif";
+        ctx.textAlign = "center"; ctx.fillStyle = `rgba(80,60,20,${a})`;
+        ctx.fillText("世界が、ひっくり返る。", CANVAS_W / 2, CANVAS_H / 2);
+      }
+    }
+
+    // Surface overlay
+    if (phase === "surfaced") {
+      const progress = Math.min(1, surfaceTimer / 3000);
+      ctx.fillStyle = `rgba(255,248,220,${Math.min(0.75, progress*1.2)})`;
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      ctx.strokeStyle = `rgba(180,220,255,${progress*0.6})`; ctx.lineWidth = 1;
+      for (const p of windParticles) {
+        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x+p.len, p.y-2); ctx.stroke();
+      }
+      if (surfaceTimer > 2000) {
+        const lines = [
+          { text: "地上に出た。",                      start: 5000  },
+          { text: "空気がうまくて、もう一度吸い込む。", start: 11000 },
+          { text: "そこにはだれも、いないようだ。",    start: 17000 },
+          { text: "きれいなせかいだと思った。",        start: 23000 },
+          { text: "風だけがふいていた。",              start: 29000 },
+        ];
+        const totalH = lines.length * 48;
+        const startY = CANVAS_H / 2 - totalH / 2;
+        ctx.font = "28px 'Hiragino Mincho ProN','Yu Mincho',serif";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        lines.forEach((line, i) => {
+          if (surfaceTimer <= line.start) return;
+          const a = Math.min(1, (surfaceTimer - line.start) / 1200);
+          ctx.fillStyle = `rgba(75,50,20,${a})`;
+          ctx.fillText(line.text, CANVAS_W / 2, startY + i * 48);
+        });
+      }
+    }
+  }, []);
+
+  // Keyboard
+  useEffect(() => {
+    const codes = ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","KeyW","KeyA","KeyS","KeyD","KeyF","Space","KeyR","KeyQ"];
+    const dn = e => { if (codes.includes(e.code)) e.preventDefault(); keys.current[e.code] = true; };
+    const up = e => { keys.current[e.code] = false; keyLatch.current[e.code] = false; };
+    window.addEventListener("keydown", dn); window.addEventListener("keyup", up);
+    return () => { window.removeEventListener("keydown", dn); window.removeEventListener("keyup", up); };
+  }, []);
+
+  const doReset = useCallback(() => {
+    const g = gs.current;
+    g.map = generateMap(); g.furniture = {};
+    g.player = { x: Math.floor(MAP_W/2), y: SURFACE_ROW };
+    g.phase = "playing"; g.furniIdx = 0; g.surfaceTimer = 0; g.windParticles = [];
+    g.lightRays = []; g.flipTimer = 0; g.lightHoleX = 0; g.lightHoleY = 0;
+    Object.keys(keys.current).forEach(k => { keys.current[k] = false; keyLatch.current[k] = false; });
+    audio.stopWind();
+    setUi(u => ({ ...u, phase: "playing", furniIdx: 0, furniCount: 0 }));
+  }, []);
+
+  const doFurni = useCallback((idx) => {
+    const g = gs.current;
+    g.furniIdx = idx != null ? idx : (g.furniIdx + 1) % FURNITURE_LIST.length;
+    setUi(u => ({ ...u, furniIdx: g.furniIdx }));
+  }, []);
+
+  const doPlace = useCallback(() => {
+    const g = gs.current;
+    const px = g.player.x, py = g.player.y;
+    const key = `${px},${py}`;
+    if (g.map[py][px] !== T.DUG) return;
+
+    const existing = g.furniture[key];
+    if (existing) {
+      // Remove: if it's a right-half marker, remove the left too
+      if (existing.startsWith("_")) {
+        const realId = existing.slice(1);
+        delete g.furniture[key];
+        delete g.furniture[`${px-1},${py}`];
+      } else {
+        const def = FURNITURE_LIST.find(f => f.id === existing);
+        delete g.furniture[key];
+        if (def && def.w === 2) delete g.furniture[`${px+1},${py}`];
+      }
+    } else {
+      const def = FURNITURE_LIST[g.furniIdx];
+      if (def.w === 2) {
+        // Check right tile is DUG and empty
+        if (px+1 < MAP_W && g.map[py][px+1] === T.DUG && !g.furniture[`${px+1},${py}`]) {
+          g.furniture[key] = def.id;
+          g.furniture[`${px+1},${py}`] = "_" + def.id;
+          audio.playPlace();
+        }
+      } else {
+        g.furniture[key] = def.id;
+        audio.playPlace();
+      }
+    }
+    // Count only real furniture (not right-half markers)
+    const count = Object.values(g.furniture).filter(v => !v.startsWith("_")).length;
+    setUi(u => ({ ...u, furniCount: count }));
+  }, []);
+
+  const doStyle = useCallback((idx) => {
+    const g = gs.current;
+    g.roomStyleIdx = idx != null ? idx : (g.roomStyleIdx + 1) % ROOM_STYLES.length;
+    setUi(u => ({ ...u, roomStyleIdx: g.roomStyleIdx }));
+  }, []);
+
+  // Game loop
+  useEffect(() => {
+    let lastTime = 0, moveTimer = 0;
+    const loop = time => {
+      const delta = time - lastTime; lastTime = time;
+      const g = gs.current;
+
+      if (g.phase === "light_peek") {
+        g.surfaceTimer += delta;
+        // Light rays grow from below
+        if (!g.lightRays) g.lightRays = [];
+        if (g.surfaceTimer % 80 < 16 && g.lightRays.length < 30) {
+          const hx = g.lightHoleX, hy = g.lightHoleY;
+          const { cx, cy } = getCamera(hx, hy);
+          const baseX = ((hx - cx) * TW + TW / 2) * RENDER_SCALE;
+          const baseY = ((hy - cy) * TH + TH) * RENDER_SCALE;
+          g.lightRays.push({
+            x: baseX + (Math.random() - 0.5) * 20 * RENDER_SCALE,
+            y: baseY,
+            angle: -Math.PI / 2 + (Math.random() - 0.5) * 0.8,
+            len: (30 + Math.random() * 80) * RENDER_SCALE,
+            alpha: 0.1 + Math.random() * 0.3,
+            width: (2 + Math.random() * 6) * RENDER_SCALE,
+          });
+        }
+        // After 3s, start flipping
+        if (g.surfaceTimer > 3000) {
+          g.phase = "flipping"; g.flipTimer = 0;
+          setUi(u => ({ ...u, phase: "flipping" }));
+        }
+        render(); raf.current = requestAnimationFrame(loop); return;
+      }
+
+      if (g.phase === "flipping") {
+        g.flipTimer += delta;
+        const flipDuration = 2500;
+        if (g.flipTimer > flipDuration) {
+          g.phase = "surfaced"; g.surfaceTimer = 0;
+          g.windParticles = Array.from({length: 40}, () => ({
+            x: Math.random() * CANVAS_W, y: Math.random() * CANVAS_H,
+            len: 20 + Math.random() * 30, speed: 0.025 + Math.random() * 0.015,
+          }));
+          g.lightRays = [];
+          setUi(u => ({ ...u, phase: "surfaced" }));
+        }
+        render(); raf.current = requestAnimationFrame(loop); return;
+      }
+
+      if (g.phase === "surfaced") {
+        g.surfaceTimer += delta;
+        if (g.surfaceTimer % (8 * 16) < 16)
+          g.windParticles.push({ x: -20, y: Math.random()*CANVAS_H, len: 20+Math.random()*30, speed: 0.025+Math.random()*0.015 });
+        g.windParticles = g.windParticles.map(p => ({...p, x: p.x + p.speed * delta})).filter(p => p.x < CANVAS_W+50);
+        render(); raf.current = requestAnimationFrame(loop); return;
+      }
+
+      moveTimer += delta;
+      if (moveTimer > 110) {
+        moveTimer = 0;
+        const k = keys.current;
+        const { player, map, furniture } = g;
+        const onLadder = hasLadder(furniture, player.x, player.y);
+        const grounded = isGrounded(map, furniture, player.x, player.y);
+
+        // Gravity: fall if not grounded and not on ladder
+        if (!grounded && !onLadder) {
+          const below = player.y + 1;
+          if (below < MAP_H && isPassable(map, player.x, below)) {
+            g.player.y = below;
+          }
+        } else {
+          // Normal input
+          let dx = 0, dy = 0;
+          if      (k["ArrowLeft"]  || k["KeyA"]) dx = -1;
+          else if (k["ArrowRight"] || k["KeyD"]) dx =  1;
+          // Up: on ladder or standing on grass
+          const curTileType = map[player.y][player.x];
+          if ((k["ArrowUp"] || k["KeyW"]) && (onLadder || curTileType === T.GRASS)) dy = -1;
+          // Down: dig or descend
+          else if (k["ArrowDown"] || k["KeyS"]) dy = 1;
+
+          if (dx !== 0) {
+            const nx = player.x + dx;
+            if (nx >= 0 && nx < MAP_W) {
+              const tile = map[player.y][nx];
+              if (tile === T.SKY || tile === T.GRASS || tile === T.DUG) {
+                g.player.x = nx;
+              } else if (tile === T.DIRT || tile === T.STONE) {
+                map[player.y][nx] = T.DUG;
+              }
+            }
+          }
+
+          if (dy !== 0) {
+            const ny = player.y + dy;
+            if (ny >= 0 && ny < MAP_H) {
+              const tile = map[ny][player.x];
+              if (dy === -1) {
+                const canGoUp = onLadder || curTileType === T.GRASS;
+                if (canGoUp && isPassable(map, player.x, ny)) {
+                  g.player.y = ny;
+                }
+              } else {
+                // Down: move into passable or dig down
+                if (isPassable(map, player.x, ny)) {
+                  g.player.y = ny;
+                } else if (tile === T.DIRT || tile === T.STONE) {
+                  map[ny][player.x] = T.DUG;
+                } else if (tile === T.BEDROCK && Object.values(g.furniture).filter(v => !v.startsWith("_")).length >= 3) {
+                  map[ny][player.x] = T.LIGHT_HOLE;
+                  audio.playDig(true);
+                }
+              }
+            }
+          }
+        }
+
+        // Check light hole: step into it to trigger ending
+        const curTile = map[g.player.y][g.player.x];
+        if (curTile === T.LIGHT_HOLE) {
+          g.phase = "light_peek"; g.surfaceTimer = 0;
+          g.lightHoleX = g.player.x; g.lightHoleY = g.player.y;
+          setUi(u => ({ ...u, phase: "light_peek" }));
+        }
+        if (k["Space"] && !keyLatch.current["Space"]) { keyLatch.current["Space"] = true; doPlace(); }
+        if (k["KeyF"]  && !keyLatch.current["KeyF"])  { keyLatch.current["KeyF"]  = true; doFurni(); }
+        if (k["KeyQ"]  && !keyLatch.current["KeyQ"])  { keyLatch.current["KeyQ"]  = true; doStyle(); }
+        if (k["KeyR"]  && !keyLatch.current["KeyR"])  { keyLatch.current["KeyR"]  = true; doReset(); }
+      }
+      render(); raf.current = requestAnimationFrame(loop);
+    };
+    raf.current = requestAnimationFrame(loop);
+    return () => { if (raf.current) cancelAnimationFrame(raf.current); };
+  }, [render, doPlace, doFurni, doStyle, doReset]);
+
+  const press   = useCallback(code => { keys.current[code] = true; }, []);
+  const release = useCallback(code => { keys.current[code] = false; keyLatch.current[code] = false; }, []);
+
+  const f      = FURNITURE_LIST[ui.furniIdx];
+  const fCount = ui.furniCount;
+  const needed = Math.max(0, 3 - fCount);
+  const curStyle = ROOM_STYLES[ui.roomStyleIdx];
+
+  return (
+    <div style={{
+      background: "#120a04", minHeight: "100vh",
+      display: "flex", flexDirection: "column", alignItems: "center",
+      fontFamily: "'Hiragino Sans','Noto Sans JP',sans-serif",
+      color: "#E8C99A", padding: "6px 8px 20px", gap: "6px",
+      userSelect: "none", WebkitUserSelect: "none", touchAction: "none",
+      overflowX: "hidden",
+    }}>
+      <div style={{ textAlign: "center", padding: "2px 0" }}>
+        <div style={{ fontSize: "15px", letterSpacing: "0.15em", color: "#D4A96A", fontWeight: "bold" }}>穴の中のマイホーム</div>
+        <div style={{ fontSize: "9px", color: "#6A5A3A" }}>地下を掘って、自分の楽園を作ろう</div>
+      </div>
+
+      <div style={{
+        width: CANVAS_W*scale, height: CANVAS_H*scale, flexShrink: 0, position: "relative",
+        perspective: "800px",
+      }}>
+        <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H}
+          style={{ display: "block", imageRendering: "pixelated", border: "2px solid #3a2010",
+            transform: `scale(${scale})${ui.phase === "flipping" ? " rotateX(180deg)" : ""}`,
+            transformOrigin: "top left",
+            transition: ui.phase === "flipping" ? "transform 2.5s ease-in-out" : "none",
+          }} />
+      </div>
+
+      {/* Info strip */}
+      <div style={{ display: "flex", gap: "6px", alignItems: "flex-start", width: CANVAS_W*scale, flexShrink: 0, flexWrap: "wrap" }}>
+
+
+        {/* Room style selector */}
+        <div style={{ background: "#1e1006", border: "1px solid #3a2010", padding: "6px 8px", borderRadius: "6px", flexShrink: 0 }}>
+          <div style={{ fontSize: "8px", color: "#6A5A3A", marginBottom: "4px" }}>部屋スタイル</div>
+          <div style={{ display: "flex", gap: "4px" }}>
+            {ROOM_STYLES.map((s, i) => (
+              <div key={s.id}
+                onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); doStyle(i); }}
+                style={{
+                  width: 48, height: 48, borderRadius: 6, cursor: "pointer",
+                  background: i === ui.roomStyleIdx ? "#3a2810" : "#150c04",
+                  border: `1px solid ${i === ui.roomStyleIdx ? "#D4A96A" : "#3a2010"}`,
+                  display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2,
+                }}>
+                <div style={{
+                  width: 28, height: 20, borderRadius: 2, overflow: "hidden",
+                  background: s.bg, border: `1px solid ${s.accent || "#444"}`,
+                  position: "relative",
+                }}>
+                  {s.floor && <div style={{ position:"absolute", bottom:0, left:0, right:0, height: s.floor.h, background: s.floor.base }} />}
+                  {s.wall  && <div style={{ position:"absolute", top:0, bottom:0, left:0, width: s.wall.w, background: s.wall.base }} />}
+                  {s.wall  && <div style={{ position:"absolute", top:0, bottom:0, right:0, width: s.wall.w, background: s.wall.base }} />}
+                  {s.ceil  && <div style={{ position:"absolute", top:0, left:0, right:0, height: s.ceil.h, background: s.ceil.base }} />}
+                </div>
+                <span style={{ fontSize: 7, color: i === ui.roomStyleIdx ? "#D4A96A" : "#9A7A5A" }}>{s.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Furniture palette */}
+        <div style={{ background: "#1e1006", border: "1px solid #3a2010", padding: "6px 8px", borderRadius: "6px", flexShrink: 0 }}>
+          <div style={{ fontSize: "8px", color: "#6A5A3A", marginBottom: "4px" }}>家具を選んで「置く」</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 44px)", gap: "4px" }}>
+            {FURNITURE_LIST.map((item, i) => (
+              <div key={item.id}
+                onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); doFurni(i); }}
+                style={{
+                  width: 44, height: 44, borderRadius: 6, cursor: "pointer",
+                  background: i === ui.furniIdx ? "#3a2810" : "#150c04",
+                  border: `1px solid ${i === ui.furniIdx ? "#D4A96A" : "#3a2010"}`,
+                  display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 1,
+                  position: "relative",
+                }}>
+                <span style={{ color: item.color, fontSize: 15, lineHeight: 1 }}>{item.sym}</span>
+                <span style={{ fontSize: 6, color: "#9A7A5A" }}>{item.label}</span>
+                {item.w === 2 && <span style={{ position: "absolute", top: 1, right: 2, fontSize: 6, color: "#6A5A3A" }}>2</span>}
+                {item.light && <span style={{ position: "absolute", top: 1, left: 2, fontSize: 6, color: "#FFD060" }}>☼</span>}
+                <span style={{ fontSize: 7, color: "#9A7A5A" }}>{item.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Progress */}
+        <div style={{ background: "#1e1006", border: `1px solid ${fCount>=3?"#D4A96A":"#3a2010"}`, padding: "6px 10px", borderRadius: "6px", minWidth: 76 }}>
+          <div style={{ fontSize: "8px", color: "#6A5A3A" }}>設置した家具</div>
+          <div style={{ fontSize: "26px", color: "#D4A96A", fontWeight: "bold", lineHeight: 1.1 }}>{fCount}</div>
+          {ui.phase === "playing"
+            ? <div style={{ fontSize: "8px", color: needed>0?"#6A5A3A":"#D4A96A", marginTop: 2 }}>
+                {needed > 0 ? `あと${needed}個で何かが起きる` : "最深部を掘ってみよう"}
+              </div>
+            : <div style={{ fontSize: "9px", color: "#FFE0A0", lineHeight: 1.6, marginTop: 3 }}>
+                地上に出た。<br/>風だけがある。
+              </div>
+          }
+        </div>
+      </div>
+
+      {/* Touch controls */}
+      <div style={{ display: "flex", gap: "20px", alignItems: "center", width: CANVAS_W*scale, justifyContent: "space-between", flexShrink: 0, flexWrap: "wrap", paddingTop: 4 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "60px 60px 60px", gridTemplateRows: "60px 60px 60px", gap: 4 }}>
+          <span/><PadBtn label="↑" code="ArrowUp" press={press} release={release}/><span/>
+          <PadBtn label="←" code="ArrowLeft" press={press} release={release}/>
+          <div style={{ background: "#1a0f08", borderRadius: 8, border: "1px solid #2a1a0a" }}/>
+          <PadBtn label="→" code="ArrowRight" press={press} release={release}/>
+          <span/><PadBtn label="↓" code="ArrowDown" press={press} release={release}/><span/>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <ActionBtn label="置く / 撤去" color="#D4A96A" onTap={doPlace}/>
+          <ActionBtn label="リセット"    color="#885533" onTap={doReset}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PadBtn({ label, code, press, release }) {
+  return (
+    <div
+      onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); press(code); }}
+      onPointerUp={()    => release(code)}
+      onPointerCancel={() => release(code)}
+      onPointerLeave={()  => release(code)}
+      style={{
+        width: 60, height: 60,
+        background: "#2a1a0a", border: "1px solid #4a3020", borderRadius: 12,
+        color: "#C4956A", fontSize: 24,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        cursor: "pointer", touchAction: "none",
+        WebkitUserSelect: "none", userSelect: "none",
+        boxShadow: "inset 0 -3px 0 #1a0a04",
+      }}>
+      {label}
+    </div>
+  );
+}
+
+function ActionBtn({ label, color, onTap }) {
+  return (
+    <div
+      onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); onTap(); }}
+      style={{
+        minWidth: 120, padding: "12px 16px", borderRadius: 12,
+        background: "#2a1a0a", border: `1px solid ${color}55`,
+        color, cursor: "pointer", touchAction: "none",
+        WebkitUserSelect: "none", userSelect: "none",
+        boxShadow: "inset 0 -3px 0 #1a0a04",
+        textAlign: "center", fontSize: 14, fontWeight: "bold",
+      }}>
+      {label}
+    </div>
+  );
+}
